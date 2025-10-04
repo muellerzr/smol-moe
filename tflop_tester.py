@@ -29,6 +29,7 @@ from accelerate.utils import AORecipeKwargs, FullyShardedDataParallelPlugin, Tor
 from utils import PerformanceTracker, create_collate_fn, get_dataset, get_model_flops_per_token
 import torch.cuda.nvtx as nvtx
 
+# torch.backends.cuda.enable_triton_flash_attention(True)
 # torch.backends.cuda.enable_flash_sdp(True)
 # torch.backends.cuda.enable_mem_efficient_sdp(True)
 # torch.backends.cuda.enable_math_sdp(False)
@@ -121,14 +122,12 @@ def main():
         log_with=args.log_with,
         gradient_accumulation_steps=1
     )
-    # accelerator.init_trackers(
-    #     project_name="FSDP2_torchao_fp8",
-    #     config={"sequence_length": args.sequence_length, "num_steps": args.num_steps},
-    # )
 
     model = AutoModelForCausalLM.from_config(
         AutoConfig.from_pretrained("./config.json", use_cache=False),
         torch_dtype=torch.bfloat16,
+        attn_implementation="flex_attention"
+    
     )
 
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
