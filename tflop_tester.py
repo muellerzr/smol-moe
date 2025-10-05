@@ -25,16 +25,21 @@ from torchao.float8 import Float8LinearConfig
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from accelerate import Accelerator
-from accelerate.utils import AORecipeKwargs, FullyShardedDataParallelPlugin, TorchDynamoPlugin, set_seed
+from accelerate.utils import AORecipeKwargs, FullyShardedDataParallelPlugin, TorchDynamoPlugin, set_seed, DistributedDataParallelKwargs, DataLoaderConfiguration
 from utils import PerformanceTracker, create_collate_fn, get_dataset, get_model_flops_per_token
 import torch.cuda.nvtx as nvtx
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
+from datasets import load_from_disk
 
 # torch.backends.cuda.enable_triton_flash_attention(True)
 # torch.backends.cuda.enable_flash_sdp(True)
 # torch.backends.cuda.enable_mem_efficient_sdp(True)
 # torch.backends.cuda.enable_math_sdp(False)
 
+torch.cuda.cudagraphs_enabled = True
+
 WARMUP_STEPS = 10
+TRACE_DIR = "fused_adam_w_compile_embeds"
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -45,6 +50,11 @@ def parse_args():
     parser.add_argument("--log-with", type=str, default="wandb", help="Log with wandb or tensorboard")
 
     return parser.parse_args()
+
+def get_dataset_offline(path="tokenized_tinystories"):
+    dataset = load_from_disk(path)
+    dataset.set_format(type="torch", columns=["input_ids", "labels", "shift_labels", "position_ids"])
+    return dataset
 
 
 def main():
@@ -59,7 +69,8 @@ def main():
     #     fsdp_version=2,
     #     cpu_ram_efficient_loading=False,  # CPU RAM efficient loading CANNOT work with fp8 torchao
     #     auto_wrap_policy="transformer_based_wrap",
-    #     transformer_cls_names_to_wrap=["LlamaDecoderLayer"],
+    #     transformer_cls_names_to_wrap=["Qwen3DecoderLayer"],
+    #     reshard_after_forward=False,
     # )
     # fsdp2_plugin.set_mixed_precision(args.precision)
 
@@ -69,111 +80,116 @@ def main():
         fullgraph=False,
     )
 
-    fp8_config = Float8LinearConfig(
-        enable_fsdp_float8_all_gather=True,  # extra saving by gathering parameters in fp8 and upcasting after
-    )
+    ddp_plugin = DistributedDataParallelKwargs(find_unused_parameters=True)
+
 
     kwargs = []
-    if args.precision == "fp8":
-        def filter_moe_experts_for_fp8(module, fqn: str, layers_to_keep_bf16: list[str]) -> bool:
-            """
-            Return True if this layer should be converted to FP8.
-
-            This filter:
-            - Includes Linear layers that have in/out dims divisible by 16 (FP8-compatible)
-            - Excludes MoE expert layers (Qwen3MoeMLP, etc.) so they stay in BF16
-            - Excludes any fully-qualified names (FQNs) explicitly passed in `layers_to_keep_bf16`
-
-            Args:
-                module (`torch.nn.Module`): The module being tested.
-                fqn (`str`): Fully qualified name of the module.
-                layers_to_keep_bf16 (`List[str]`): Explicit list of layers to *exclude* from FP8 conversion.
-
-            Returns:
-                bool: True → convert to FP8, False → keep as BF16.
-            """
-            # Skip any user-specified layers
-            if fqn in layers_to_keep_bf16:
-                return False
-
-            # Skip MoE expert submodules (by class name or name pattern)
-            moe_keywords = ("experts", "mlp.experts", "Qwen3MoeMLP")
-            if any(k in fqn for k in moe_keywords):
-                return False
-
-            # Only consider torch.nn.Linear layers for FP8
-            if isinstance(module, torch.nn.Linear):
-                # FP8 kernels require in/out dims % 16 == 0
-                if module.in_features % 16 == 0 and module.out_features % 16 == 0:
-                    return True
-                else:
-                    return False
-
-            # Non-linear layers: don’t convert
-            return False
-        kwargs = [AORecipeKwargs(
-            config=fp8_config, 
-            module_filter_func=lambda m, fqn: filter_moe_experts_for_fp8(m, fqn, layers_to_keep_bf16=["model.embed_tokens", "lm_head", "mlp.experts"])
-            )]
+    kwargs=[ddp_plugin]
 
     accelerator = Accelerator(
         dynamo_plugin=dynamo_plugin,
         kwargs_handlers=kwargs,
         log_with=args.log_with,
-        gradient_accumulation_steps=1
+        gradient_accumulation_steps=1,
+        
     )
 
     model = AutoModelForCausalLM.from_config(
         AutoConfig.from_pretrained("./config.json", use_cache=False),
         torch_dtype=torch.bfloat16,
         attn_implementation="flex_attention"
-    
     )
+
+    model.model.embed_tokens = torch.compile(model.model.embed_tokens)
 
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
-    dataset = get_dataset(tokenizer, args.sequence_length, accelerator)
-    dataloader = DataLoader(dataset, batch_size=10, collate_fn=create_collate_fn(), pin_memory=True, persistent_workers=True, num_workers=8)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, fused=True)
+    # dataset = get_dataset(tokenizer, args.sequence_length, accelerator)
+    dataset = get_dataset_offline()
+    dataloader = DataLoader(dataset, batch_size=8, collate_fn=create_collate_fn(), pin_memory=True)
 
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+
     accelerator.wait_for_everyone()
 
     model.train()
 
-    total_num_steps = 50
+    total_num_steps = 200
     model_flops_per_token = get_model_flops_per_token(model, args.sequence_length)
     performance_tracker = PerformanceTracker(warmup_steps=5)
 
+    # Setup profiler if enabled
+    # profiler_context = None
+    # if accelerator.is_main_process:
+    #     # Create profiler schedule: skip warmup, then profile for specified steps
+    #     profiler_schedule = schedule(
+    #         skip_first=WARMUP_STEPS,  # Skip warmup steps
+    #         wait=1,  # Wait 1 step after warmup
+    #         warmup=100,  # Warmup profiler for 2 steps
+    #         active=10,  # Profile for this many steps
+    #         repeat=1  # Only profile once
+    #     )
+        
+    #     profiler_context = profile(
+    #         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    #         schedule=profiler_schedule,
+    #         on_trace_ready=torch.profiler.tensorboard_trace_handler(TRACE_DIR),
+    #         record_shapes=True,  # Record tensor shapes
+    #         profile_memory=True,  # Track memory usage
+    #         with_stack=True,  # Record source code information
+    #         with_flops=True,  # Estimate FLOPs
+    #     )
+    #     accelerator.print(f"Profiler enabled")
+    #     accelerator.print(f"Results will be saved to: {TRACE_DIR}")
+    #     accelerator.print(f"View with: tensorboard --logdir={TRACE_DIR}")
+
+    # if profiler_context:
+    #     profiler_context.__enter__()
+    import time
+    prefetch_stream = torch.cuda.Stream()
+    next_batch = None
+    # if accelerator.is_main_process:
+    start_time = time.time()
+    len_inputs = 0
     for step, batch in enumerate(dataloader):
         if step >= total_num_steps:
             break
-
-        with nvtx.range("forward"):
+        with torch.cuda.stream(prefetch_stream):
+            next_batch = {k: v.to(device=accelerator.device, non_blocking=True)
+                      for k, v in batch.items()}
+        torch.cuda.current_stream().wait_stream(prefetch_stream)
+        batch = next_batch
+        # with record_function("forward"):
+        if (step + 1) % 8 != 0:
+            with model.no_sync():
+                outputs = model(**batch)
+                loss = outputs.loss / 8
+        else:
             outputs = model(**batch)
-        loss = outputs.loss
-        with nvtx.range("backward"):
-           accelerator.backward(loss)
-        optimizer.step()
-        optimizer.zero_grad()
-        metrics = performance_tracker.step(batch["input_ids"].numel(), model_flops_per_token)
+            loss = outputs.loss / 8
+        # with record_function("backward"):
+        accelerator.backward(loss)
+        # with record_function("optimizer_step"):
+        if (step + 1) % 8 == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+        # if profiler_context:
+        #     profiler_context.step()
 
-        print_msg = f"Step {step}/{total_num_steps}, Loss: {loss.item():.4f}"
-        if "warmup_completed" in metrics:
-            accelerator.print("Warm up completed! Starting training")
-        elif metrics:
-            print_msg += performance_tracker.get_print_message(metrics)
+    # if accelerator.is_main_process:
+    end_time = time.time()
+    print(f'Time taken for training: {end_time-start_time}')
 
-        if step % 10 == 0 or step == total_num_steps - 1:
-            accelerator.print(print_msg)
-
-        accelerator.log(metrics)
 
     accelerator.wait_for_everyone()
     accelerator.end_training()
-    accelerator.print("Training completed!")
+    # if profiler_context:
+    #     profiler_context.__exit__(None, None, None)
+
+    # accelerator.print("Training completed!")
 
 
 if __name__ == "__main__":
