@@ -24,6 +24,7 @@ from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from accelerate import Accelerator
+from torch.nn.utils.rnn import pad_sequence
 
 
 def get_dataset(tokenizer: AutoTokenizer, seq_len: int, accelerator: Accelerator | None = None) -> Dataset:
@@ -48,6 +49,7 @@ def get_dataset(tokenizer: AutoTokenizer, seq_len: int, accelerator: Accelerator
             truncation=True,
             max_length=seq_len,
             return_tensors=None,
+            
         )
         tokenized_batch["labels"] = tokenized_batch["input_ids"].copy()
         return tokenized_batch
@@ -99,11 +101,11 @@ def get_model_flops_per_token(model: AutoModelForCausalLM, seq_len: int) -> floa
         model (AutoModelForCausalLM): Model to get the flops for
         seq_len (int): Sequence length
     """
-    cfg = model.config
+    cfg = model.module.config
     head_dim = cfg.hidden_size // cfg.num_attention_heads
 
     # MLP: 3 matmuls
-    mlp_flops = 18 * cfg.hidden_size * cfg.intermediate_size
+    mlp_flops = 18 * cfg.hidden_size * cfg.num_experts_per_tok * cfg.moe_intermediate_size
 
     # Attn (w/o dotproduct)
     attn_flops = 12 * head_dim * (cfg.num_attention_heads + cfg.num_key_value_heads)
@@ -114,16 +116,19 @@ def get_model_flops_per_token(model: AutoModelForCausalLM, seq_len: int) -> floa
     # we also ignore embeddings and layernorms, etc
     return (mlp_flops + attn_flops + attn_dotproduct_flops) * cfg.num_hidden_layers
 
-
 def create_collate_fn():
-    """Create a collate function for batching."""
-
+    """Simple collate function compatible with pre-tokenized datasets."""
     def collate_fn(batch):
-        input_ids = torch.tensor([item["input_ids"] for item in batch], dtype=torch.long)
-        shift_labels = torch.tensor([item["shift_labels"] for item in batch], dtype=torch.long)
-        return {"input_ids": input_ids, "shift_labels": shift_labels, "labels": shift_labels}
-
+        # each field is already a tensor from the dataset
+        input_ids = torch.stack([item["input_ids"] for item in batch])
+        shift_labels = torch.stack([item["shift_labels"] for item in batch])
+        return {
+            "input_ids": input_ids,
+            "shift_labels": shift_labels,
+            "labels": shift_labels,
+        }
     return collate_fn
+
 
 
 class PerformanceTracker:
