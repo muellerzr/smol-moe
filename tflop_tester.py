@@ -38,8 +38,11 @@ from datasets import load_from_disk
 
 torch.cuda.cudagraphs_enabled = True
 
+# torch.backends.cuda.matmul.allow_tf32 = True 
+# torch.set_float32_matmul_precision('medium')
+
 WARMUP_STEPS = 10
-TRACE_DIR = "fused_adam_w_compile_embeds"
+TRACE_DIR = "tf32_matmul_precision"
 
 def parse_args():
     parser = argparse.ArgumentParser()
